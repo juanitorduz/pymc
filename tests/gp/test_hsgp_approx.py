@@ -198,7 +198,7 @@ class TestHSGP(_BaseFixtures):
             else:
                 assert n_coeffs == n_basis, "one was dropped when it shouldn't have been"
 
-    @pytest.mark.parametrize("boundary", ["robin", ["neumann", "dirichlet"]])
+    @pytest.mark.parametrize("boundary", ["robin", ("neumann", "robin")], ids=str)
     def test_boundary_validation(self, boundary):
         cov_func = pm.gp.cov.ExpQuad(1, ls=1)
         with pytest.raises(ValueError, match="`boundary` must be one of"):
@@ -228,6 +228,24 @@ class TestHSGP(_BaseFixtures):
         var = ((phi**2) * sqrt_psd**2).sum(axis=1).eval()
         np.testing.assert_allclose(var[0], 4.0, atol=1e-6)
         np.testing.assert_allclose(var[1], 1.0, atol=1e-6)
+
+    def test_boundary_per_dimension(self):
+        """A sequence gives one condition per active dimension: Neumann in the first (variance 2
+        at its ends), Dirichlet in the second (variance 0 at its ends)."""
+        X = np.array([[-1.0, -1.0], [-1.0, 0.0], [0.0, -1.0], [0.0, 0.0], [1.0, 1.0]])
+        cov_func = pm.gp.cov.ExpQuad(2, ls=0.3)
+        with pm.Model():
+            gp = pm.gp.HSGP(
+                m=[60, 60], L=[1.0, 1.0], boundary=("neumann", "dirichlet"), cov_func=cov_func
+            )
+            phi, sqrt_psd = gp.prior_linearized(X)
+        var = ((phi**2) * sqrt_psd**2).sum(axis=1).eval()
+        np.testing.assert_allclose(var[:4], [0.0, 2.0, 0.0, 1.0], atol=1e-6)
+
+    def test_boundary_per_dimension_validation(self):
+        cov_func = pm.gp.cov.ExpQuad(2, ls=1)
+        with pytest.raises(ValueError, match="one entry per active dimension"):
+            pm.gp.HSGP(m=[10, 10], c=2.0, boundary=("neumann",), cov_func=cov_func)
 
     @pytest.mark.parametrize("boundary, var_at_L", [("dirichlet", 0.0), ("neumann", 2.0)])
     def test_conditional_past_training_range(self, boundary, var_at_L):
@@ -515,9 +533,10 @@ class TestLaplaceEigenbasis:
         for boundary in ["dirichlet", "dirichlet-neumann", "neumann-dirichlet"]:
             assert not np.any(calc_eigenvalues(L, m, boundary=boundary) == 0)
 
-    def test_invalid_boundary(self):
+    @pytest.mark.parametrize("boundary", ["robin", ("neumann", "robin")], ids=str)
+    def test_invalid_boundary(self, boundary):
         with pytest.raises(ValueError, match="`boundary` must be one of"):
-            calc_eigenvalues(np.array([1.0]), [3], boundary="robin")
+            calc_eigenvalues(np.array([1.0, 1.0]), [3, 3], boundary=boundary)
 
     @staticmethod
     def _gram(boundary, L, m, n_grid=4001):
@@ -612,9 +631,19 @@ class TestLaplaceEigenbasis:
         K_hsgp = ((phi * psd) @ phi.T).eval()
         np.testing.assert_allclose(K_hsgp, self._images_kernel_1d(x, L[0], ls, boundary), atol=1e-8)
 
-    @pytest.mark.parametrize("boundary", BOUNDARIES)
+    @pytest.mark.parametrize(
+        "boundary",
+        [
+            *BOUNDARIES,
+            ("neumann", "dirichlet"),
+            ("neumann-dirichlet", "neumann"),
+            ("dirichlet", "dirichlet-neumann"),
+        ],
+        ids=str,
+    )
     def test_covariance_matches_closed_form_2d(self, boundary):
-        # ExpQuad is separable, so the 2D closed form is the Hadamard product of 1D ones.
+        # ExpQuad is separable, so the 2D closed form is the Hadamard product of 1D ones,
+        # each with its own boundary condition.
         L, m, ls = np.array([2.0, 3.0]), [80, 80], 1.0
         x1 = np.linspace(-2.0, 2.0, 7)
         x2 = np.linspace(-3.0, 3.0, 9)
@@ -624,6 +653,11 @@ class TestLaplaceEigenbasis:
         phi = calc_eigenvectors(Xs, L, eigvals, m, boundary=boundary)
         psd = pm.gp.cov.ExpQuad(2, ls=ls).power_spectral_density(np.sqrt(eigvals))
         K_hsgp = ((phi * psd) @ phi.T).eval()
-        K1 = self._images_kernel_1d(Xs[:, 0], L[0], ls, boundary)
-        K2 = self._images_kernel_1d(Xs[:, 1], L[1], ls, boundary)
+        b1, b2 = (boundary, boundary) if isinstance(boundary, str) else boundary
+        K1 = self._images_kernel_1d(Xs[:, 0], L[0], ls, b1)
+        K2 = self._images_kernel_1d(Xs[:, 1], L[1], ls, b2)
         np.testing.assert_allclose(K_hsgp, K1 * K2, atol=1e-8)
+
+    def test_per_dimension_boundary_length_mismatch(self):
+        with pytest.raises(ValueError, match="one entry per active dimension"):
+            calc_eigenvalues(np.array([1.0, 1.0]), [3, 3], boundary=("neumann",))

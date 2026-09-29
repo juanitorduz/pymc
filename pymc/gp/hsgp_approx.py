@@ -30,6 +30,7 @@ from pymc.gp.mean import Mean, Zero
 
 TensorLike = np.ndarray | pt.TensorVariable
 BoundaryConditionType = Literal["dirichlet", "neumann", "dirichlet-neumann", "neumann-dirichlet"]
+BoundaryLike = BoundaryConditionType | Sequence[BoundaryConditionType]
 
 # Laplace eigenbasis on [-L, L]: phi_j(x) = trig(sqrt(lambda_j) (x + L)) with
 # lambda_j = (pi j / (2 L))**2, j = j0, j0 + 1, ..., j0 + m - 1. The name reads as
@@ -42,11 +43,18 @@ _BOUNDARY_CONDITIONS: dict[str, tuple[float, str]] = {
 }
 
 
-def _check_boundary(boundary: str) -> None:
-    if not isinstance(boundary, str) or boundary not in _BOUNDARY_CONDITIONS:
+def _boundary_per_dim(boundary: BoundaryLike, n_dims: int) -> tuple[BoundaryConditionType, ...]:
+    """Validate ``boundary`` and expand it to one condition per active dimension."""
+    boundaries = (boundary,) * n_dims if isinstance(boundary, str) else tuple(boundary)
+    for b in boundaries:
+        if not isinstance(b, str) or b not in _BOUNDARY_CONDITIONS:
+            raise ValueError(f"`boundary` must be one of {tuple(_BOUNDARY_CONDITIONS)}, got {b!r}.")
+    if len(boundaries) != n_dims:
         raise ValueError(
-            f"`boundary` must be one of {tuple(_BOUNDARY_CONDITIONS)}, got {boundary!r}."
+            "`boundary`, if given as a sequence, must have one entry per active dimension "
+            f"({n_dims}), got {len(boundaries)}."
         )
+    return boundaries
 
 
 def set_boundary(X: TensorLike, c: numbers.Real | TensorLike) -> np.ndarray:
@@ -63,9 +71,7 @@ def set_boundary(X: TensorLike, c: numbers.Real | TensorLike) -> np.ndarray:
     return L
 
 
-def calc_eigenvalues(
-    L: TensorLike, m: Sequence[int], boundary: BoundaryConditionType = "dirichlet"
-):
+def calc_eigenvalues(L: TensorLike, m: Sequence[int], boundary: BoundaryLike = "dirichlet"):
     """Calculate eigenvalues of the Laplacian on the box ``[-L, L]``.
 
     Parameters
@@ -74,8 +80,10 @@ def calc_eigenvalues(
         Half-width of the approximation domain, one value per dimension.
     m : Sequence[int]
         Number of basis vectors per dimension.
-    boundary : {"dirichlet", "neumann", "dirichlet-neumann", "neumann-dirichlet"}
-        Boundary condition of the eigenbasis, applied to every dimension. All conditions
+    boundary : str or sequence of str, default "dirichlet"
+        Boundary condition of the eigenbasis, one of ``"dirichlet"``, ``"neumann"``,
+        ``"dirichlet-neumann"``, ``"neumann-dirichlet"``; a single string applies to every
+        dimension, a sequence gives one condition per dimension. All conditions
         share ``lambda_j = (pi j / (2 L))**2`` and differ in the index set: Dirichlet
         ``j = 1, ..., m``; Neumann ``j = 0, ..., m - 1`` (``j = 0`` is the constant mode);
         mixed ``j = 1/2, 3/2, ..., m - 1/2``.
@@ -86,9 +94,9 @@ def calc_eigenvalues(
         Array of shape ``(prod(m), len(m))`` with one eigenvalue per dimension per basis vector
         (NumPy if ``L`` is NumPy, otherwise a PyTensor expression).
     """
-    _check_boundary(boundary)
-    j0, _ = _BOUNDARY_CONDITIONS[boundary]
-    S = np.meshgrid(*[np.arange(j0, j0 + m[d]) for d in range(len(m))])
+    boundaries = _boundary_per_dim(boundary, len(m))
+    j0 = [_BOUNDARY_CONDITIONS[b][0] for b in boundaries]
+    S = np.meshgrid(*[np.arange(j0[d], j0[d] + m[d]) for d in range(len(m))])
     S_arr = np.vstack([s.flatten() for s in S]).T
 
     return np.square((np.pi * S_arr) / (2 * L))
@@ -99,7 +107,7 @@ def calc_eigenvectors(
     L: TensorLike,
     eigvals: TensorLike,
     m: Sequence[int],
-    boundary: BoundaryConditionType = "dirichlet",
+    boundary: BoundaryLike = "dirichlet",
 ):
     """Calculate eigenvectors of the Laplacian on the box ``[-L, L]``.
 
@@ -116,8 +124,9 @@ def calc_eigenvectors(
         Output of :func:`calc_eigenvalues` computed with the same ``boundary``.
     m : Sequence[int]
         Number of basis vectors per dimension.
-    boundary : {"dirichlet", "neumann", "dirichlet-neumann", "neumann-dirichlet"}
-        Boundary condition of the eigenbasis. With ``omega_j = sqrt(lambda_j)``:
+    boundary : str or sequence of str, default "dirichlet"
+        Boundary condition of the eigenbasis, a single string for every dimension or one per
+        dimension (see :func:`calc_eigenvalues`). With ``omega_j = sqrt(lambda_j)``:
         ``"dirichlet"`` and ``"dirichlet-neumann"`` use ``sin(omega_j (x + L)) / sqrt(L)``
         (zero at ``-L``); ``"neumann"`` and ``"neumann-dirichlet"`` use
         ``cos(omega_j (x + L)) / sqrt(L)`` (zero slope at ``-L``). The condition at ``+L``
@@ -129,13 +138,13 @@ def calc_eigenvectors(
     pt.TensorVariable
         Tensor of shape ``(n, prod(m))``.
     """
-    _check_boundary(boundary)
-    j0, trig_name = _BOUNDARY_CONDITIONS[boundary]
-    trig = getattr(pt, trig_name)
+    boundaries = _boundary_per_dim(boundary, len(m))
     m_star = int(np.prod(m))
 
     phi = pt.ones((Xs.shape[0], m_star))
     for d in range(len(m)):
+        j0, trig_name = _BOUNDARY_CONDITIONS[boundaries[d]]
+        trig = getattr(pt, trig_name)
         omega = pt.sqrt(eigvals[:, d])
         c = 1.0 / pt.sqrt(L[d])
         if j0 == 0:
@@ -143,7 +152,6 @@ def calc_eigenvectors(
             c = pt.switch(pt.eq(omega, 0.0), 1.0 / pt.sqrt(2.0 * L[d]), c)
         term2 = pt.tile(Xs[:, d][:, None], m_star) + L[d]
         phi *= c * trig(omega * term2)
-
     return phi
 
 
@@ -284,9 +292,12 @@ class HSGP(Base):
     parametrization: str
         Whether to use the `centered` or `noncentered` parametrization when multiplying the
         basis by the coefficients.
-    boundary: str, default "dirichlet"
-        Boundary condition of the Laplace eigenbasis at the two ends of the approximation box,
-        applied to every active dimension. The name reads as ``"<at lower end>-<at upper end>"``:
+    boundary: str or sequence of str, default "dirichlet"
+        Boundary condition of the Laplace eigenbasis at the two ends of the approximation box.
+        A single string applies to every active dimension; a sequence with one entry per active
+        dimension sets the condition dimension by dimension, e.g. ``("neumann", "dirichlet")``
+        for zero slope at both ends of the first dimension and zero value at both ends of the
+        second. Each name reads as ``"<at lower end>-<at upper end>"``:
 
         - ``"dirichlet"``: sine basis, the approximate GP is pinned to zero at both ends and its
           prior variance shrinks to zero there.
@@ -395,7 +406,7 @@ class HSGP(Base):
         drop_first: bool = False,
         parametrization: str | None = "noncentered",
         *,
-        boundary: BoundaryConditionType = "dirichlet",
+        boundary: BoundaryLike = "dirichlet",
         mean_func: Mean = Zero(),
         cov_func: Covariance,
     ):
@@ -426,7 +437,7 @@ class HSGP(Base):
         if parametrization not in ["centered", "noncentered"]:
             raise ValueError("`parametrization` must be either 'centered' or 'noncentered'.")
 
-        _check_boundary(boundary)
+        self._boundary = _boundary_per_dim(boundary, cov_func.n_dims)
 
         if drop_first:
             warnings.warn(
@@ -436,7 +447,6 @@ class HSGP(Base):
             )
 
         self._drop_first = drop_first
-        self._boundary = boundary
         self._m = m
         self._m_star = self.n_basis_vectors = int(np.prod(self._m))
         self._L: pt.TensorVariable | None = None
